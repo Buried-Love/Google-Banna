@@ -24,35 +24,118 @@ const GENERATION_MODEL = process.env.NANO_BANANA_GENERATION_MODEL || 'nano-banan
 
 const bufferToBase64 = (buffer) => buffer.toString('base64');
 
-const callNanoBanana = async ({ model, apiKey, contents }) => {
-  const endpoint = `${API_HOST}/v1beta/models/${model}:generateContent?key=${apiKey}`;
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      contents,
-      generationConfig: {
-        responseModalities: ['IMAGE']
+const isChannelUnavailable = (status, body) => {
+  if (status === 503) return true;
+  if (!body) return false;
+  return /No available channels/i.test(body);
+};
+
+const callNanoBanana = async ({ model, apiKey, contents, fallbackModels = [] }) => {
+  const uniqueFallbacks = fallbackModels.filter(
+    (candidate, index, list) =>
+      Boolean(candidate) &&
+      list.indexOf(candidate) === index &&
+      candidate !== model
+  );
+
+  const modelsToTry = [model, ...uniqueFallbacks];
+  let lastError = null;
+
+  for (let index = 0; index < modelsToTry.length; index += 1) {
+    const currentModel = modelsToTry[index];
+    const endpoint = `${API_HOST}/v1beta/models/${currentModel}:generateContent?key=${apiKey}`;
+
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          contents,
+          generationConfig: {
+            responseModalities: ['IMAGE']
+          }
+        })
+      });
+
+      if (!response.ok) {
+        const errorBody = await response.text();
+        const error = new Error(
+          `Nano Banana request failed (${response.status}) [${currentModel}]: ${errorBody}`
+        );
+        error.status = response.status;
+        error.body = errorBody;
+        error.model = currentModel;
+        lastError = error;
+
+        const channelUnavailable = isChannelUnavailable(response.status, errorBody);
+        const hasFallback = index < modelsToTry.length - 1;
+
+        if (channelUnavailable && hasFallback) {
+          console.warn(
+            `Model ${currentModel} is unavailable (${response.status}). Attempting fallback ${modelsToTry[index + 1]}.`
+          );
+          continue;
+        }
+
+        if (channelUnavailable) {
+          error.friendlyMessage =
+            '当前模型通道不可用，请稍后重试或在环境变量中配置备用模型。';
+        }
+
+        throw error;
       }
-    })
-  });
 
-  if (!response.ok) {
-    const errorBody = await response.text();
-    throw new Error(`Nano Banana request failed (${response.status}): ${errorBody}`);
+      const data = await response.json();
+      if (!data?.candidates?.length) {
+        const error = new Error(`Nano Banana response from ${currentModel} did not include any candidates.`);
+        error.model = currentModel;
+        throw error;
+      }
+
+      const parts = data.candidates
+        .flatMap((candidate) => candidate?.content?.parts || [])
+        .map((part) => part?.inlineData?.data || part?.inline_data?.data)
+        .filter(Boolean);
+
+      if (!parts.length) {
+        const error = new Error(`Nano Banana response from ${currentModel} did not contain image data.`);
+        error.model = currentModel;
+        throw error;
+      }
+
+      if (index > 0) {
+        console.info(`Model ${currentModel} succeeded after attempting fallback options.`);
+      }
+
+      return { data: parts, modelUsed: currentModel };
+    } catch (error) {
+      lastError = error;
+      const message = error.body || error.message || '';
+      const channelUnavailable = isChannelUnavailable(error.status, message);
+      const hasFallback = index < modelsToTry.length - 1;
+
+      if (channelUnavailable && hasFallback) {
+        console.warn(
+          `Model ${currentModel} failed due to unavailable channel. Trying fallback ${modelsToTry[index + 1]}.`
+        );
+        continue;
+      }
+
+      throw error;
+    }
   }
 
-  const data = await response.json();
-  if (!data?.candidates?.length) {
-    throw new Error('Nano Banana response did not include any candidates.');
+  if (lastError) {
+    if (isChannelUnavailable(lastError.status, lastError.body || lastError.message)) {
+      lastError.friendlyMessage =
+        lastError.friendlyMessage || '当前模型通道不可用，请稍后重试或在环境变量中配置备用模型。';
+    }
+    throw lastError;
   }
 
-  return data.candidates
-    .flatMap((candidate) => candidate?.content?.parts || [])
-    .map((part) => part?.inlineData?.data || part?.inline_data?.data)
-    .filter(Boolean);
+  throw new Error('Nano Banana request failed without additional details.');
 };
 
 const buildRefinementPrompt = (productType) => `Refine this ${productType} jewelry product photo.
@@ -152,11 +235,18 @@ app.post(
           }
         ];
 
-        const refined = await callNanoBanana({
+        const { data: refined, modelUsed } = await callNanoBanana({
           model: REFINEMENT_MODEL,
           apiKey: resolvedApiKey,
-          contents
+          contents,
+          fallbackModels: [
+            process.env.NANO_BANANA_REFINEMENT_FALLBACK_MODEL || 'gemini-2.5-flash-image'
+          ]
         });
+
+        if (modelUsed !== REFINEMENT_MODEL) {
+          console.info(`Refinement for ${field} completed via fallback model ${modelUsed}.`);
+        }
 
         refinedImages[field] = refined[0];
       }
@@ -216,11 +306,16 @@ app.post(
         }
       ];
 
-      const generatedImages = await callNanoBanana({
+      const { data: generatedImages, modelUsed: generationModel } = await callNanoBanana({
         model: GENERATION_MODEL,
         apiKey: resolvedApiKey,
-        contents: generationContents
+        contents: generationContents,
+        fallbackModels: [process.env.NANO_BANANA_GENERATION_FALLBACK_MODEL].filter(Boolean)
       });
+
+      if (generationModel !== GENERATION_MODEL) {
+        console.info(`Generation completed via fallback model ${generationModel}.`);
+      }
 
       res.json({
         refinedImages,
@@ -228,7 +323,10 @@ app.post(
       });
     } catch (error) {
       console.error(error);
-      res.status(500).json({ error: error.message || 'Unexpected error occurred.' });
+      const statusCode = error.status && Number.isInteger(error.status) ? error.status : 500;
+      res.status(statusCode).json({
+        error: error.friendlyMessage || error.message || 'Unexpected error occurred.'
+      });
     }
   }
 );

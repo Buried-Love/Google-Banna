@@ -44,8 +44,8 @@ npm run start
 后端默认运行在 `http://localhost:4000`，负责：
 
 1. 校验必需上传项。
-2. 调用 `gemini-2.5-flash-image-preview` 模型进行产品精修。
-3. 调用 `gemini-2.5-flash-image` 模型生成佩戴图，两张候选图返回前端。
+2. 优先调用 `gemini-2.5-flash-image-preview` 模型进行产品精修；若该通道不可用，会自动回退至 `gemini-2.5-flash-image`。
+3. 使用 `nano-banana-fast` 模型生成佩戴图（可配置其他模型作为备用通道），并返回两张候选图。
 
 ### 2. 启动前端
 
@@ -63,10 +63,10 @@ npm run dev
 
 后端默认使用 `http://jeniya.top` 作为中转域名，通过以下两个端点与服务对接：
 
-- `POST /v1beta/models/gemini-2.5-flash-image-preview:generateContent`：用于产品精修，可通过 `NANO_BANANA_REFINEMENT_MODEL` 调整模型名称。
-- `POST /v1beta/models/nano-banana-fast:generateContent`：用于生成模特佩戴图，可通过 `NANO_BANANA_GENERATION_MODEL` 覆盖。
+- `POST /v1beta/models/gemini-2.5-flash-image-preview:generateContent`：用于产品精修，可通过 `NANO_BANANA_REFINEMENT_MODEL` 调整模型名称，并在 `NANO_BANANA_REFINEMENT_FALLBACK_MODEL` 中指定备用模型。
+- `POST /v1beta/models/nano-banana-fast:generateContent`：用于生成模特佩戴图，可通过 `NANO_BANANA_GENERATION_MODEL` 覆盖，并在 `NANO_BANANA_GENERATION_FALLBACK_MODEL` 中配置备用通道。
 
-请求参数遵循 Google Gemini 原生格式，通过 `contents` 数组提交提示词与 `inline_data` 图片，`generationConfig.responseModalities` 设为 `IMAGE` 以获取图像结果。
+请求参数遵循 Google Gemini 原生格式，通过 `contents` 数组提交提示词与 `inline_data` 图片，`generationConfig.responseModalities` 设为 `IMAGE` 以获取图像结果。当返回 `503` 或提示 “No available channels” 时，服务会自动尝试备用模型；若仍失败，接口会给出明确的中文错误提示，提醒稍后重试或调整配置。
 
 ## 自定义与扩展
 
